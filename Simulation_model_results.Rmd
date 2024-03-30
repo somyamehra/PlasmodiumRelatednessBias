@@ -1,0 +1,543 @@
+---
+title: "Simulation model"
+author: "Somya Mehra"
+date: "2024-02-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(paneljudge)
+library(poisbinom)
+library(Pv3Rs)
+library(paneljudge)
+library(igraph)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(cowplot)
+library(ggridges)
+library(ggh4x)
+library(ggExtra)
+library(viridis)
+
+knitr::opts_chunk$set(echo=TRUE, warning=FALSE, message=FALSE, fig.align = "center")
+
+library(extrafont)
+font_import() # takes a few minutes
+loadfonts(device="postscript")
+
+library(showtext)
+font_add(family = "Arial", regular = "Arial.ttf") ## here is the path to the font to add.
+showtext.auto()
+```
+
+## Data input
+
+```{r data_input}
+set.seed("260823")
+
+source("Simulation_model_code/estimate_relatedness.R")
+source("Simulation_model_code/simulation_model.R")
+
+if (!dir.exists("Numerical_results")) dir.create("Numerical_results")
+if (!dir.exists("Numerical_results/Figures")) dir.create("Numerical_results/Figures")
+if (!dir.exists("Numerical_results/Simulated_data")) dir.create("Numerical_results/Simulated_data")
+
+RUN_ALL <- TRUE
+
+MAX_CLONAL_CLUSTER <- 4  # subgraph size for relationship graph
+N_MARKER_DENSE <- 24000  # number of markers for dense simulated data
+N_MARKER_SPARSE <- 200   # number of markers for sparse data (polymorphic, downsampled from dense)
+N_LINEAGES <- 100        # number of unrelated founder lineages
+N_SAMPLES <- 100         # size of simulated parasite population
+N_GENERATIONS <- 10      # number of generations of inbreeding
+PROB_COTRANS <- 0.4      # enriched probability of outbreeding within subgraphs
+M <- 1000                 # av consecutive markers inherited from a single parent
+P <- 0.9                 # expected frequency of major allele in founder population 
+
+N_MARKER_DOWNSAMPLE <- seq(500, 12000, 500)
+N_MARKER_DOWNSAMPLE_SUBSET <- c(500, 1000, 1500, 2000, 4000, 8000, 12000)
+# number of downsampled (polymorphic) markers to illustrate HMM vs independence model tradeoff
+```
+
+## Run simulation model
+
+Simulate successive generations of inbreeding, capturing dense genotypic data whilst accommodating marker linkage
+
+```{r run_dense_data_simulation}
+if (RUN_ALL || !file.exists("Numerical_results/Simulated_data/dense_data_simulation.rds")) {
+  dense_data_sim <- simulate_inbreeding(max_clonal_cluster=MAX_CLONAL_CLUSTER, 
+                                           n_markers=N_MARKER_DENSE, 
+                                           n_lineages=N_LINEAGES, 
+                                           n_samples=N_SAMPLES, 
+                                           n_generations=N_GENERATIONS, 
+                                           prob_cotrans=PROB_COTRANS, 
+                                           M=M, p=P)
+  write_rds(dense_data_sim, "Numerical_results/Simulated_data/dense_data_simulation.rds",
+            compress="gz")
+} else {
+  dense_data_sim <- read_rds("Numerical_results/Simulated_data/dense_data_simulation.rds")
+}
+
+```
+
+## Generate relatedness estimates
+
+Generate relatedness estimates for the subset of polymorphic markers within the dense simulated dataset across each generation
+
+```{r dense_data_ibd}
+pairwise_classifications <- lapply(1:N_GENERATIONS, function(i) {
+  classify_pairs(dense_data_sim[["relatedness_graphs"]][[i]],
+                 dense_data_sim[["enriched_cotrans_components"]][[i]])}) %>% 
+  bind_rows(.id="generation")
+
+if (RUN_ALL || !file.exists("Numerical_results/Simulated_data/dense_data_sim_ibd_estimates.rds")) {
+  dense_data_ibd <- estimate_relatedness_sim(dense_data_sim, 
+                                             loci_to_keep=paste0("m", 1:N_MARKER_DENSE), 
+                                             generations=1:N_GENERATIONS)
+  write_rds(dense_data_ibd, "Numerical_results/Simulated_data/dense_data_sim_ibd_estimates.rds", compress="gz")
+} else {
+  dense_data_ibd <- read_rds("Numerical_results/Simulated_data/dense_data_sim_ibd_estimates.rds")
+}
+
+polymorphic_marker_info <- lapply(dense_data_sim[["locus_metrics"]], function(x) {
+  x %>% subset(prop_pair_ibs<1) %>% mutate(maf=(1-sqrt(2*prop_pair_ibs-1))/2)
+})
+```
+
+Generate a sparse dataset by downsampling polymorphic markers and generate relatedness estimates across each generation
+```{r sparse_data_ibd}
+sparse_marker_subsets <- lapply(polymorphic_marker_info, function(x) {
+  paste0("m", sort(as.numeric(gsub("m", "", sample(rownames(x), N_MARKER_SPARSE)))))})
+
+locus_metrics_sparse <- 
+  lapply(1:N_GENERATIONS, function(i) dense_data_sim[["locus_metrics"]][[i]][sparse_marker_subsets[[i]],])
+
+sparse_data_ibd <- list()
+for (i in 1:N_GENERATIONS) {
+  if (RUN_ALL || !file.exists(paste0("Numerical_results/Simulated_data/sparse_data_sim_ibd_estimates_G", i, ".rds"))) {
+    sparse_data_ibd[[i]] <- estimate_relatedness_sim(dense_data_sim,
+                                                     loci_to_keep=sparse_marker_subsets[[i]],
+                                                     generations=i)
+    write_rds(sparse_data_ibd[[i]], paste0("Numerical_results/Simulated_data/sparse_data_sim_ibd_estimates_G", i, ".rds"), compress="gz")
+  }
+  else {
+    sparse_data_ibd[[i]] <- read_rds(paste0("Numerical_results/Simulated_data/sparse_data_sim_ibd_estimates_G", i, ".rds"))
+  }
+}
+```
+
+Downsample markers at the final simulated generation of inbreeding (N_GENERATIONS=`r N_GENERATIONS`)
+
+```{r downsample_data_ibd}
+N_MARKER_DOWNSAMPLE <- subset(N_MARKER_DOWNSAMPLE, N_MARKER_DOWNSAMPLE<=min(sapply(polymorphic_marker_info, nrow)))
+N_MARKER_DOWNSAMPLE_SUBSET <- subset(N_MARKER_DOWNSAMPLE_SUBSET, N_MARKER_DOWNSAMPLE_SUBSET<=min(sapply(polymorphic_marker_info, nrow)))
+
+downsample_marker_subsets <- lapply(N_MARKER_DOWNSAMPLE, function(n_subset) {
+  paste0("m", sort(as.numeric(gsub("m", "", sample(rownames(polymorphic_marker_info[[N_GENERATIONS]]), 
+                                                     n_subset)))))})
+
+names(downsample_marker_subsets) <- paste0("N_", N_MARKER_DOWNSAMPLE)
+
+downsampled_data_ibd <- list()
+for (i in names(downsample_marker_subsets)) {
+  if (RUN_ALL || !file.exists(paste0("Numerical_results/Simulated_data/downsampled_data_sim_ibd_estimates_G_", N_GENERATIONS, "_", i, ".rds"))) {
+    downsampled_data_ibd[[i]] <- estimate_relatedness_sim(dense_data_sim,
+                                                          loci_to_keep=downsample_marker_subsets[[i]],
+                                                          generations=N_GENERATIONS)
+    write_rds(downsampled_data_ibd[[i]], paste0("Numerical_results/Simulated_data/downsampled_data_sim_ibd_estimates_G_", N_GENERATIONS, "_", i, ".rds"), compress="gz")
+  }
+  else {
+    downsampled_data_ibd[[i]] <- read_rds(paste0("Numerical_results/Simulated_data/downsampled_data_sim_ibd_estimates_G_", N_GENERATIONS, "_", i, ".rds"))
+  }
+}
+
+downsampled_data_ibd_summary <- 
+  lapply(downsampled_data_ibd, function(x) x[["ibd_ibs_est"]]) %>% 
+  bind_rows(.id="random_subset")
+```
+
+## Numerical results
+
+#### Summary of pairwise relatedness over successive generations of inbreeding 
+```{r standard_model_summary_plot, echo=FALSE, fig.height=12, fig.width=14}
+sim_ibd_summary <- list("Dense data"=dense_data_ibd[["ibd_ibs_est"]],
+                        "Sparse data"=lapply(sparse_data_ibd, function(x) x[["ibd_ibs_est"]]) %>%
+                          bind_rows(.id="generation"))
+
+relatedness_hist <- lapply(names(sim_ibd_summary), function(markers) {
+  sim_ibd_summary[[markers]] %>%
+    transmute(generation=as.numeric(generation),
+              `(1) Realised fraction\nof sites IBD`=realised_IBD,
+              `(2) Independence model,\nstandard nIBD-to-IBS model`=naive_r,
+              `(3) Independence model,\nstandard (n)IBD-to-allele model`=rhat_naive_indep,
+              `(4) HMM,\nstandard (n)IBD-to-allele model`=rhat_naive_hmm) %>%
+    reshape2::melt(id=c("generation")) %>%
+    ggplot() + 
+    geom_histogram(aes(x=value, fill=generation), col="black", bins=100, size=0.08) +
+    ggh4x::facet_grid2(variable~generation, 
+                       scale="free_y", independent="y", switch="y") + 
+    xlab("Relatedness") + ylab("") + 
+    ggtitle(markers) +
+    viridis::scale_fill_viridis() + 
+    guides(y.sec=guide_none(title="Number of parasite pairs")) + 
+    theme_bw() + theme(legend.position = "none", strip.placement = "outside", 
+                       strip.text.y.left = element_text(angle = 0, face = "bold"),
+                       strip.text.x = element_text(face = "bold"),
+                       axis.text.x = element_text(size=7.5, angle=90),
+                       axis.text.y = element_text(size=7.5),
+                       plot.title = element_text(face="bold", hjust=0.5))
+
+})
+
+error_boxplot <- lapply(names(sim_ibd_summary), function(markers) {
+  sim_ibd_summary[[markers]] %>%
+    transmute(generation=as.numeric(generation),
+              realised_IBD=realised_IBD,
+              `(1) Independence model,\nstandard nIBD-to-IBS model`=naive_r,
+              `(2) Independence model,\nstandard (n)IBD-to-allele model`=rhat_naive_indep,
+              `(3) HMM,\nstandard (n)IBD-to-allele model`=rhat_naive_hmm) %>%
+    reshape2::melt(id=c("generation", "realised_IBD")) %>%
+    ggplot(aes(x=value-realised_IBD, y=generation, group=generation)) + 
+    geom_boxplot(aes(fill=generation), outlier.size = 0.1, size=0.2) + 
+    annotate("segment", y=-Inf, yend=Inf, x=0, xend=0, col="#737373", lty=2, lwd=0.8) + 
+    xlab("Error (estimate - realised fraction IBD)") + ylab("Generation") +
+    ggtitle(markers) +
+    facet_wrap(vars(variable), nrow=1) + coord_flip() + 
+    scale_y_continuous(breaks=1:N_GENERATIONS) +
+    viridis::scale_fill_viridis() +
+    theme_bw() + theme(legend.position = "none",
+                       strip.text = element_text(face="bold"),
+                       axis.text = element_text(size=7.5),
+                       plot.title = element_text(face="bold", hjust=0.5))
+})
+
+standard_model_summary_plot <-
+  plot_grid(plot_grid(plotlist=relatedness_hist, ncol=1, align="vh", axis="tblr", 
+                      labels=c("(A)", "(B)")),
+            plot_grid(plotlist=error_boxplot, nrow=1, align="vh", axis="tblr", 
+                      labels=c("(C)", "(D)")),
+            ncol=1, align="vh", axis="tblr", rel_heights = c(2, 1))
+
+pdf("Numerical_results/Figures/standard_model_summary_plot.pdf", height=12, width=14)
+show(standard_model_summary_plot)
+invisible(dev.off())
+
+show(standard_model_summary_plot)
+```
+
+#### Misspecification of the standard nIBD-to-IBS model over successive generations of inbreeding
+
+```{r standard_model_misspecification_plot, echo=FALSE, fig.height=4, fig.width=9}
+misspecification_plot <- dense_data_sim[["locus_metrics"]] %>%
+  bind_rows(.id="generation") %>% 
+  mutate(generation=as.numeric(generation)) %>%
+  ggplot() +
+  geom_point(aes(y=prop_pair_ibs, x=prop_pair_ibc, color=generation), 
+             size=0.01, alpha=0.3, col="black", pch=20) +
+  geom_abline(lty=2) +
+  facet_wrap(vars(generation), nrow=2) + 
+  xlab("Corrected nIBD-to-IBS model") +
+  ylab("Standard nIBD-to-IBS model") +
+  scale_color_viridis_c() + 
+  coord_cartesian(xlim=c(0, 1), ylim=c(0, 1)) +
+  theme_bw() + theme(legend.position = "none")
+
+png("Numerical_results/Figures/standard_model_misspecification.png",
+    height=4, width=9, units = "in", res=300)
+show(misspecification_plot)
+invisible(dev.off())
+
+show(misspecification_plot)
+```
+
+#### Relatedness estimates under (n)IBD independence and the corrected nIBD-to-IBS model over successive generations of inbreeding
+```{r corrected_model_plots, echo=FALSE, fig.height=4, fig.width=6}
+corrected_model_plot <- lapply(names(sim_ibd_summary), function(markers) {
+  sim_ibd_summary[[markers]] %>% mutate(generation=as.numeric(generation)) %>%
+    ggplot(aes(x=corrected_r-realised_IBD, y=generation, group=generation)) +
+    geom_boxplot(aes(fill=generation), outlier.size = 0.1, size=0.2) + 
+    annotate("segment", y=-Inf, yend=Inf, x=0, xend=0, col="#737373", lty=2, lwd=0.8) + 
+    xlab("Error (estimate - realised fraction IBD)") + ylab("Generation") +
+    ggtitle(markers) + coord_flip() +
+    scale_x_continuous(limits=c(-0.3, 0.6)) +
+    scale_fill_viridis_c() +
+    theme_bw() + theme(legend.position = "none",
+                       strip.text = element_text(face="bold"),
+                       axis.text = element_text(size=7.5),
+                       plot.title = element_text(face="bold", hjust=0.5))
+})
+
+corrected_model_plot <- plot_grid(plotlist=corrected_model_plot, 
+                                  align="vh", axis="tblr", nrow=1, labels=c("(A)", "(B)"))
+
+pdf("Numerical_results/Figures/corrected_model_boxplot.pdf", height=4, width=6)
+show(corrected_model_plot)
+invisible(dev.off())
+
+show(corrected_model_plot)
+```
+
+#### Joyplots of relatedness estimates for siblings over successive generations of inbreeding
+```{r sibling_joyplots, echo=FALSE, fig.height=8, fig.width=6}
+dense_data_pairwise_ibd <- dense_data_ibd[["ibd_ibs_est"]] %>% 
+  mutate(p1=pmin(V1, V2), p2=pmax(V1, V2)) %>% dplyr::select(-V1, -V2) %>%
+  merge(pairwise_classifications, all=TRUE) %>%
+  mutate(rship=ifelse(is.na(rship), "stranger", rship),
+         enriched_cotrans=ifelse(is.na(enriched_cotrans), 0, enriched_cotrans)) %>%
+  dplyr::select(generation, p1, p2, rship, realised_IBD, rhat_naive_indep, rhat_naive_hmm, enriched_cotrans) %>%
+  reshape2::melt(id=c("generation", "p1", "p2", "rship", "enriched_cotrans")) %>%
+  mutate(generation=factor(generation, levels=as.character(1:10)),
+         measure=factor(ifelse(variable=="realised_IBD", "Realised relatedness",
+                         ifelse(variable=="rhat_naive_indep", "Relative relatedness estimate: (n)IBD independence",
+                                "Absolute relatedness estimate: HMM")),
+                        levels=c("Realised relatedness", 
+                                 "Relative relatedness estimate: (n)IBD independence",
+                                 "Absolute relatedness estimate: HMM")))
+
+
+sibling_joyplot <- ggplot(dense_data_pairwise_ibd %>% subset(rship=="sibling")) + 
+  annotate("segment", x=0.5, xend=0.5, y=-Inf, yend=Inf, alpha=0.8, lwd=0.6, lty=2) + 
+  geom_density_ridges(aes(x=value, y=generation, color=measure, fill=measure, alpha=measure, lwd=measure)) + 
+  scale_x_continuous(limits=c(0, 1), expand=c(0, 0)) + 
+  scale_y_discrete(expand = expand_scale(add = c(0.05, 1.35))) +
+  scale_alpha_manual(values=c(0.2, 0, 0), name="") +
+  scale_size_manual(values=c(0, 0.8, 0.8), name="") +
+  scale_fill_manual(values=c("black", "#cc9143", "navyblue"), name="") +
+  scale_color_manual(values=c("black", "#cc9143", "navyblue"), name="") +
+  xlab("Pairwise relatedness") + ylab("Successive generations of inbreeding") +
+  ggtitle("Relatedness between siblings") +
+  guides(color=guide_legend(ncol =1), fill=guide_legend(ncol =1),
+         alpha=guide_legend(ncol =1), size=guide_legend(ncol =1)) +
+  theme_bw() + theme(panel.grid.major.x = element_blank(),
+                     panel.grid.minor.x = element_blank(),
+                     axis.line.y = element_line(arrow = grid::arrow(length = unit(0.4, "cm")), size=1.5),
+                     axis.ticks.y = element_blank(),
+                     axis.text.y = element_blank(),
+                     axis.title.y = element_text(size=12),
+                     plot.title = element_text(face="bold", hjust=0.5),
+                     legend.text = element_text(size=11),
+                     #plot.background = element_rect(fill="black"),
+                     #panel.background = element_rect(fill="black"),
+                     panel.border = element_rect(color="white"),
+                     legend.position = "bottom")
+
+pdf("Numerical_results/Figures/sibling_joyplot.pdf", height=8, width=6)
+show(sibling_joyplot)
+invisible(dev.off())
+
+show(sibling_joyplot)
+```
+
+#### Bias in pairwise relatedness estimates as a function of marker density (for downsampled data)
+```{r mitigating_bias_plot, echo=FALSE, fig.height=6, fig.width=11}
+mitigating_bias_plot_data <- downsampled_data_ibd_summary %>%
+  transmute(`(A) Independence model with standard (n)IBD-to-allele model`=rhat_naive_indep,
+            `(B) HMM with standard (n)IBD-to-allele model`=rhat_naive_hmm,
+            `(C) Independence model with theoretically adjusted nIBD-to-IBS model`=corrected_r,
+            n_markers=as.numeric(gsub("N_", "", random_subset)), 
+            realised_IBD=realised_IBD) %>%
+  reshape2::melt(id=c("n_markers", "realised_IBD")) %>% 
+  mutate(value=value-realised_IBD) 
+
+error_boxplots <- ggplot(mitigating_bias_plot_data,
+       aes(x=value, y=n_markers, group=n_markers)) + 
+  geom_boxplot(outlier.size=0.001, lwd=0.25, fill="#b7c7e8") + 
+  geom_vline(aes(xintercept=0), col="navyblue", lty=2) +  
+  facet_wrap(vars(variable), strip.position="top", ncol=1) + 
+  coord_flip() + 
+  scale_x_continuous(limits=c(-0.3, 0.1), expand=c(0, 0)) + 
+  xlab("Error in pairwise relatedness estimate\n(relative to fraction of sites IBD)") + 
+  ylab("Number of biallelic SNPs") + 
+  theme_bw() + theme(strip.text = element_text(face="bold", size=10))
+
+frac_IBD_histogram <- dense_data_ibd[["ibd_ibs_est"]] %>% 
+  subset(generation==N_GENERATIONS) %>% 
+  ggplot(aes(x=realised_IBD)) + 
+  geom_histogram(bins=100, fill="#9e8fc4", lwd=0.25, col="black") + 
+  xlab("Fraction of (polymorphic) sites IBD") +
+  ylab("Number of pairs") +
+  ggtitle("(D) Realised fraction of sites IBD") + 
+  theme_bw() + theme(plot.title = element_text(face="bold", size=11, hjust=0.5))
+
+mitigating_bias_plot <- 
+  plot_grid(error_boxplots, plot_grid(NULL, frac_IBD_histogram, NULL, ncol=1, rel_heights = c(1,2.5,1)), 
+            nrow=1, rel_widths = c(2.25, 1))
+
+
+pdf("Numerical_results/Figures/mitigating_bias_plot.pdf", height=6, width=11)
+show(mitigating_bias_plot)
+invisible(dev.off())
+
+show(mitigating_bias_plot)
+```
+
+#### Pairwise relatedness estimates as a function of marker density (for downsampled data)
+```{r mitigating_bias_appendix_plot, echo=FALSE, fig.height=12, fig.width=10.5}
+mitigating_bias_appendix_plot_data <- downsampled_data_ibd_summary %>%
+  transmute(`(B) HMM with\nstandard (n)IBD-to-allele model`=rhat_naive_hmm,
+            `(C) Independence model with\nstandard nIBD-to-allele model`=naive_r,
+            `(D) Independence model with\nstandard (n)IBD-to-allele model`=rhat_naive_indep,
+            `(E) Independence model with\ncorrected nIBD-to-IBS model`=corrected_r,
+            n_markers=factor(gsub("N_", "No SNPs: ", random_subset),
+                             levels=paste0("No SNPs: ", N_MARKER_DOWNSAMPLE)), 
+            realised_IBD=realised_IBD) %>%
+  subset(n_markers %in% paste0("No SNPs: ", N_MARKER_DOWNSAMPLE_SUBSET)) %>%
+  reshape2::melt(id=c("n_markers", "realised_IBD"))
+
+ibd_scatterplots <- ggplot(mitigating_bias_appendix_plot_data, aes(x=realised_IBD, y=value)) +
+  geom_point(size=0.01, alpha=0.1) +
+  geom_abline(col="blue", lty=2, lwd=0.5) +
+  facet_grid(n_markers~variable) + 
+  xlab("Fraction of (polymorphic) sites IBD") +
+  ylab("Pairwise relatedness estimate") +
+  theme_bw() + theme(strip.text.y = element_text(angle=0),
+                     strip.text.x = element_text(face="bold", size=10))
+
+ibd_histogram <- frac_IBD_histogram + ggtitle("(A) Realised fraction of sites IBD") +
+  theme(plot.title = element_text(size=10))
+
+mitigating_bias_appendix_plot <-
+  cowplot::plot_grid(cowplot::plot_grid(NULL, ibd_histogram, NULL, rel_widths = c(1, 3, 1), nrow=1),
+                     ibd_scatterplots, rel_heights = c(1, 3), ncol=1)
+  
+
+png("Numerical_results/Figures/mitigating_bias_appendix_plot.png",
+    height=12, width=10.5, units = "in", res=300)
+show(mitigating_bias_appendix_plot)
+invisible(dev.off())
+
+show(mitigating_bias_appendix_plot)
+```
+
+#### Error in pairwise relatedness estimates under the HMM as a function of marker density (for downsampled data)
+```{r hmm_elbow_plots, echo=FALSE, fig.height=2.5, fig.width=12}
+hmm_elbow_plot <- downsampled_data_ibd_summary %>%
+  mutate(n_markers=factor(gsub("N_", "No SNPs: ", random_subset),
+                          levels=paste0("No SNPs: ", N_MARKER_DOWNSAMPLE))) %>%
+  subset(n_markers %in% paste0("No SNPs: ", N_MARKER_DOWNSAMPLE_SUBSET)) %>%
+  ggplot() +
+  geom_point(aes(x=realised_IBD, y=rhat_naive_hmm-realised_IBD), size=0.01, alpha=0.1) + 
+  geom_abline(lty=2, col="blue", aes(slope=0, intercept=0)) + 
+  facet_grid(cols=vars(n_markers)) +
+  xlab("Realised fraction of sites IBD") + ylab("Error") +
+  ggtitle("Error structure for thinned data estimates under HMM") +
+  theme_bw() + theme(plot.title = element_text(face="bold", hjust=0.5))
+
+
+pdf("Numerical_results/Figures/sparse_hmm_elbow_plots.pdf",
+    height=2.5, width=12)
+show(hmm_elbow_plot)
+invisible(dev.off())
+
+show(hmm_elbow_plot)
+```
+
+#### Zero inflation in pairwise relatedness estimates
+```{r zero_inflation_plot, echo=FALSE, fig.height=8, fig.width=6}
+ibd_estimates <- dense_data_ibd[["ibd_ibs_est"]] %>% subset(generation==N_GENERATIONS)
+
+expected_IBS_unrelated <- 
+  posterior_ibs(1, polymorphic_marker_info[[N_GENERATIONS]]$prop_pair_ibs, 0) %>%
+  mutate(posterior_pdf=posterior_pdf*max(IBS), IBS=IBS/max(IBS))
+
+mean_locuswise_IBD <- mean(polymorphic_marker_info[[N_GENERATIONS]]$prop_pair_ibd)
+mean_locuswise_IBS <- mean(polymorphic_marker_info[[N_GENERATIONS]]$prop_pair_ibs)
+
+r_estimates <- ibd_estimates %>% subset(naive_r>1e-8) %>%
+  mutate(r=round(naive_r, 2)) %>%
+  group_by(r) %>% summarise(count=n()) %>%
+  mutate(freq=count/sum(count))
+
+expected_IBS_convolution <- 
+  posterior_ibs(1, polymorphic_marker_info[[N_GENERATIONS]]$prop_pair_ibs,
+                seq(0, 1, 0.01)) %>%
+  mutate(posterior_pdf=posterior_pdf*max(IBS), IBS=IBS/max(IBS)) %>%
+  merge(r_estimates) %>%
+  group_by(IBS) %>% summarise(prob=sum(posterior_pdf*freq))
+
+empirical_IBS_plot <- ggplot() + 
+  geom_histogram(data=ibd_estimates, aes(x=ibs), bins=100, fill="#cc9143", 
+                 alpha=0.5, col="black", lwd=0.2) +
+  geom_density(data=expected_IBS_unrelated, aes(x=IBS, y=posterior_pdf*5), 
+               fill="navyblue", alpha=0.1, stat="identity") + 
+  geom_vline(aes(xintercept=mean_locuswise_IBS), lwd=1, lty=2, col="navyblue") + 
+  annotate("label", x=mean_locuswise_IBS, y=600, hjust=-0.2, vjust=1.2,
+           label="expected IBS for\n'unrelated' pairs", color="navyblue") +
+  annotate("label", x=0.85, y=100, label="empirical IBS\nfor all pairs", color="#bd7211") +
+  scale_x_continuous(limits = c(min(ibd_estimates$ibs), max(ibd_estimates$ibs))) +
+  scale_y_continuous(expand=c(0, 0)) +
+  xlab("Fraction of polymorphic sites IBS") +
+  ylab("Number of parasite pairs") +
+  ggtitle("Empirical IBS for all pairs vs expected IBS for 'unrelated' pairs") +
+  theme_bw() + theme(plot.title = element_text(hjust=0.5, face="bold"))
+
+empirical_IBS_vs_IBD_plot <- ibd_estimates %>% 
+  select(V1, V2, ibs, rhat_naive_indep, rhat_naive_hmm) %>%
+  reshape2::melt(id=c("V1", "V2", "ibs")) %>%
+  ggplot() + 
+  geom_point(aes(x=ibs, y=value, color=variable), size=0.2, alpha=0.3) + 
+  geom_vline(aes(xintercept=mean_locuswise_IBS), lwd=1, lty=2, col="navyblue") + 
+  annotate("label", x=0.8, y=0.42, label="HMM", col="#065e29") +
+  annotate("label", x=0.84, y=0.18, label="Independence", col="#c7603e") +
+  xlab("Fraction of polymorphic sites IBS") +
+  ylab("Estimates with standard (n)IBD-to-allele model") +
+  ggtitle("Dense data estimates vs fraction of sites IBS") +
+  scale_color_manual(values=c("#c7603e", "#065e29")) +
+  theme_bw() + theme(plot.title = element_text(hjust=0.5, face="bold"),
+                     legend.position = "none")
+
+zero_inflation_plot <- plot_grid(empirical_IBS_plot, empirical_IBS_vs_IBD_plot, 
+                                 ncol=1, align="h", axis="lr", labels=c("(A)", "(B)"), 
+                                 rel_heights=c(0.8, 1))
+
+pdf("Numerical_results/Figures/zero_inflation_plot.pdf", height=8, width=6)
+show(zero_inflation_plot)
+invisible(dev.off())
+
+show(zero_inflation_plot)
+```
+
+#### Rationale for dense data elbow diagnostic
+```{r dense_data_diagnostic_plot, echo=FALSE, fig.height=6, fig.width=12}
+
+dense_data_elbow_plot <- ggplot(ibd_estimates) + 
+  geom_point(aes(x=rhat_naive_hmm, y=rhat_naive_indep), size=0.2, alpha=0.3) + 
+  geom_abline(color="blue", lty=2) +
+  coord_cartesian(xlim=c(0, 1), ylim=c(0, 1)) +
+  xlab("HMM of relatedness\nwith standard (n)IBD-to-allele model") +
+  ylab("Independence model of relatedness\nwith standard (n)IBD-to-allele model") +
+  ggtitle("Dense data estimates under independence\nvs dense data estimates under HMM") +
+  theme_bw() + theme(plot.title = element_text(hjust=0.5, face="bold"))
+
+dense_data_elbow_plot_m <- 
+  ggMarginal(dense_data_elbow_plot, type="histogram", bins=100)
+
+dense_data_realised <- ggplot(ibd_estimates) + 
+  geom_point(aes(x=realised_IBD, y=rhat_naive_indep), size=0.2, alpha=0.3) + 
+  geom_abline(color="blue", lty=2) +
+  geom_vline(aes(xintercept=mean_locuswise_IBD), lwd=1.2, color="#7866d4") +
+  annotate("label", x=mean_locuswise_IBD, y=0.9, 
+           label="mean locuswise\nIBD sharing", color="#7866d4") +
+  scale_x_continuous(expand=c(0, 0)) +
+  coord_cartesian(xlim=c(0, 1), ylim=c(0, 1)) + 
+  xlab("Realised fraction of sites IBD") +
+  ylab("Independence model of relatedness\nwith standard (n)IBD-to-allele model") +
+  ggtitle("Dense data estimates under independence\nvs realised fraction of sites IBD") +
+  theme_bw() + theme(plot.title = element_text(hjust=0.5, face="bold"))
+
+dense_data_realised_m <- 
+  ggMarginal(dense_data_realised, type="histogram", bins=100, xparams=list(fill="#7866d4"))
+
+dense_data_diagnostic_plot <- 
+  plot_grid(dense_data_realised_m, dense_data_elbow_plot_m,
+                   nrow=1, align="vh", axis="tblr", labels=c("(A)", "(B)"))
+
+pdf("Numerical_results/Figures/dense_data_elbow_diagnostic_sim.pdf", height=6, width=12)
+show(dense_data_diagnostic_plot)
+invisible(dev.off())
+
+show(dense_data_diagnostic_plot)
+
+```
