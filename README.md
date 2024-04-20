@@ -1,4 +1,4 @@
-This repository contains code and a minimum analysis dataset to accompany the manuscript **Systematic bias in malaria parasite relatedness estimation** by Mehra et al, 2024.
+This repository contains code and a minimum analysis dataset to accompany the manuscript **Systematic bias in malaria parasite relatedness estimation** by Mehra et al, 2024. This is available as a preprint on bioRxiv: <https://www.biorxiv.org/content/10.1101/2024.04.16.588675v1>.
 
 The analysis can be reproduced by running the R Markdown files as follows:
 * *Simulation_model_results.Rmd*:  this runs a simulation model of parasite ancestries, and performs numerical analyses of pairwise relatedness on simulated genotypic data.  
